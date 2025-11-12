@@ -33,27 +33,46 @@ def generate_random_pairs(buffer_size, num_pairs=None):
     return pairs[:num_pairs]
 
 
-def random_sample_points(points, num_samples=30000):
-    if len(points) <= num_samples:
-        return points
+# def random_sample_points(points, num_samples=30000):
+#     if len(points) <= num_samples:
+#         return points
     
-    indices = np.random.choice(len(points), num_samples, replace=False)
-    return points[indices]
+#     indices = np.random.choice(len(points), num_samples, replace=False)
+#     return points[indices]
+
+
+def random_sample_points(points, voxel_size=0.2, max_samples=30000):
+    # points = np.array(points)
+    voxel_indices = np.floor(points / voxel_size).astype(np.int32)
+    
+    _, unique_indices = np.unique(voxel_indices, axis=0, return_index=True)
+    
+    sampled_points = points[unique_indices]
+    
+    if len(sampled_points) > max_samples:
+        indices = np.random.choice(len(sampled_points), max_samples, replace=False)
+        sampled_points = sampled_points[indices]
+
+    return sampled_points
+
 
 
 class FarmMapper:
     def __init__(self, data_root, lidar_resolution=5, buffer_size=10, 
-                 num_random_pairs=None, fitness_threshold=0.95, sample_points_num=30000):
+                 num_random_pairs=None, fitness_threshold=0.95, sample_points_num=30000,
+                 cell_size=0.1, use_obstacles_only=False):
         self.data_root = Path(data_root)
         self.lidar_resolution = lidar_resolution
         self.buffer_size = buffer_size
         self.num_random_pairs = num_random_pairs if num_random_pairs is not None else buffer_size // 2
         self.fitness_threshold = fitness_threshold
         self.sample_points_num = sample_points_num
+        self.cell_size = cell_size  # Cell size in meters (e.g., 0.1 = 10cm)
+        self.use_obstacles_only = use_obstacles_only  # If True, use only obstacle points for ICP
         
         self.lidar_dir = self.data_root / "LiDAR"
         self.rgb_dir = self.data_root / "RGB-D"
-        self.vis_dir = self.data_root / "visualization"
+        self.vis_dir = Path("./visualization")
         self.vis_dir.mkdir(parents=True, exist_ok=True)
         self.visualizer = MapVisualizer(self.vis_dir)
         
@@ -62,7 +81,7 @@ class FarmMapper:
         self.robot_yaw = 0.0
         
         self.point_cloud_buffer = deque(maxlen=buffer_size)
-        self.local_occupancy_buffer = deque(maxlen=buffer_size)
+        self.local_cell_map_buffer = deque(maxlen=buffer_size)
         self.buffer_positions = deque(maxlen=buffer_size)
         self.buffer_yaws = deque(maxlen=buffer_size)
         
@@ -74,6 +93,8 @@ class FarmMapper:
         
         print(f"FarmMapper initialized")
         print(f"LiDAR resolution: {self.lidar_resolution}cm/cell")
+        print(f"Cell size: {self.cell_size*100:.0f}cm ({self.cell_size}m)")
+        print(f"Use obstacles only for ICP: {self.use_obstacles_only}")
         print(f"Window size: {self.buffer_size} frames")
         print(f"Random pairs per window: {self.num_random_pairs}")
         print(f"Fitness threshold: {self.fitness_threshold}")
@@ -86,172 +107,167 @@ class FarmMapper:
         cy = 553.83
         return np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
     
-    def find_latest_files(self):
-        bin_files = sorted(self.lidar_dir.glob("*.bin"))
-        rgb_files = sorted(self.rgb_dir.glob("rgb.png"))
-        
-        if len(bin_files) > 0 and len(rgb_files) > 0:
-            return bin_files[-1], rgb_files[-1]
-        return None, None
-    
     def load_rgb_from_png(self, png_path):
-        if not png_path.exists():
-            return None
+        for _ in range(50):
+                        
+            if not os.path.exists(png_path):
+                time.sleep(1)
+                continue
+                        
+            rgb = cv2.imread(str(png_path))
+            if rgb is not None:
+                rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+            return rgb
         
-        rgb = cv2.imread(str(png_path))
-        if rgb is not None:
-            rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
-        
-        return rgb
+        if not os.path.exists(png_path):
+            print(f"{png_path} not exists.")
+            exit()
     
-    def load_lidar_from_bin(self, bin_path, min_distance=2, max_distance=30.0):
-        if not bin_path.exists():
-            return None
         
-        with open(bin_path, 'rb') as f:
-            data = f.read()
+
+    def load_lidar_from_bin(self, bin_path, min_distance=0.1, max_distance=50.0):
+        for _ in range(50):
+                
+            if not os.path.exists(bin_path):
+                time.sleep(1)
+                continue
+            
+            points = np.fromfile(bin_path, dtype=np.float32)
+
+            points = points[3:].reshape(-1, 4)/ 100.0
+
+            transformed = np.zeros_like(points)
+            transformed[:, 0] = points[:, 1]
+            transformed[:, 1] = points[:, 0]
+            transformed[:, 2] = -points[:, 2]
+            transformed[:, 3] = points[:, 3]
+            transformed = transformed[transformed[:,2] < 0]
+            
+            distances = np.sqrt(transformed[:, 0]**2 + transformed[:, 1]**2)
+            distance_mask = distances <= max_distance
+            robot_body_mask = ~((transformed[:, 1] >= -0.8) & (transformed[:, 1] <= 0.2) & 
+                    (transformed[:, 0] >= -0.6) & (transformed[:, 0] <= 0.65))
+            
+            transformed = transformed[distance_mask & robot_body_mask]
+            
+
+            sampled_points = random_sample_points(transformed, max_samples=self.sample_points_num)
+            sampled_points = np.array(sampled_points[:, :-1], dtype=np.float64)
+            
+            return sampled_points
         
-        file_size = len(data)
-        
-        if file_size % 16 == 0:
-            points = np.frombuffer(data, dtype=np.float32).reshape(-1, 4)
-            xyz = points[:, :3]
-        elif file_size % 12 == 0:
-            points = np.frombuffer(data, dtype=np.float32).reshape(-1, 3)
-            xyz = points[:, :3]
-        elif file_size % 20 == 0:
-            points = np.frombuffer(data, dtype=np.float32).reshape(-1, 5)
-            xyz = points[:, :3]
-        else:
-            points = np.frombuffer(data, dtype=np.float32)
-            num_points = len(points) // 3
-            xyz = points[:num_points*3].reshape(-1, 3)
-        
-        points_m = xyz / 100.0
-        
-        transformed = np.zeros_like(points_m)
-        transformed[:, 0] = -points_m[:, 1]
-        transformed[:, 1] = points_m[:, 0]
-        transformed[:, 2] = points_m[:, 2]
-        
-        distances = np.sqrt(transformed[:, 0]**2 + transformed[:, 1]**2)
-        valid_points = transformed[(distances >= min_distance) & (distances <= max_distance)]
-        
-        sampled_points = random_sample_points(valid_points, self.sample_points_num)
-        
-        return sampled_points
-    
-    def points_to_ground_occupancy(self, points, height_threshold=0.05):
+        if not os.path.exists(bin_path):
+            print(f"{bin_path} not exists.")
+            exit()
+            
+            
+    def points_to_cell_map(self, points, height_threshold=-0.5):
+        """
+        Convert point cloud to cell-based map
+        Returns: dict with cell coordinates as keys and values: 0=unknown, 1=road, 2=obstacle
+        """
         if len(points) == 0:
             return {}
         
-        ground_points = points[points[:, 2] < height_threshold]
-        obstacle_points = points[points[:, 2] >= height_threshold]
+        cell_map = {}
         
-        occupancy = {}
+        # Group points by cell
+        for p in points:
+            # Calculate cell coordinates based on cell_size
+            cell_x = int(np.floor(p[0] / self.cell_size))
+            cell_y = int(np.floor(p[1] / self.cell_size))
+            cell_key = (cell_x, cell_y)
+            
+            # Determine if this point is road or obstacle based on height
+            if p[2] < height_threshold:
+                point_type = 1  # road
+            else:
+                point_type = 2  # obstacle
+            
+            # Update cell: obstacles take priority over road
+            if cell_key not in cell_map:
+                cell_map[cell_key] = point_type
+            elif cell_map[cell_key] == 1 and point_type == 2:
+                # If cell was marked as road but we found an obstacle, update it
+                cell_map[cell_key] = 2
         
-        for p in ground_points:
-            gx = round(p[0], 2)
-            gy = round(p[1], 2)
-            key = (gx, gy)
-            occupancy[key] = 0
+        return cell_map
+    
+    def filter_obstacle_points(self, points, height_threshold=-0.5):
+        """
+        Filter only obstacle points (above height_threshold) for ICP
+        Returns: obstacle points only
+        """
+        if len(points) == 0:
+            return points
         
-        for p in obstacle_points:
-            gx = round(p[0], 2)
-            gy = round(p[1], 2)
-            key = (gx, gy)
-            occupancy[key] = 1
+        # Keep only points above the height threshold (obstacles)
+        obstacle_mask = points[:, 2] >= height_threshold
+        obstacle_points = points[obstacle_mask]
         
-        return occupancy
+        print(f"    Filtered: {len(points)} total -> {len(obstacle_points)} obstacles ({len(obstacle_points)/len(points)*100:.1f}%)")
+        
+        return obstacle_points
     
     def process_files(self, bin_path, rgb_path):
-        print(f"\nProcessing files:")
-        print(f"  BIN: {bin_path.name}")
-        print(f"  RGB: {rgb_path.name}")
+
+        lidar = self.load_lidar_from_bin(bin_path)
+        rgb = self.load_rgb_from_png(rgb_path)
         
-        max_attempts = 100
-        attempt = 0
         
-        while attempt < max_attempts:
-            lidar = self.load_lidar_from_bin(bin_path)
-            rgb = self.load_rgb_from_png(rgb_path)
-            
-            if lidar is None:
-                print("  No LiDAR data available")
-                return False
-            
-            if len(lidar) < 100:
-                print("  Too few points")
-                return False
-            
-            local_occupancy = self.points_to_ground_occupancy(lidar)
-            
-            temp_buffer = list(self.point_cloud_buffer) + [lidar.copy()]
-            
-            if len(self.buffer_positions) == 0:
-                self.point_cloud_buffer.append(lidar.copy())
-                self.local_occupancy_buffer.append(local_occupancy)
-                self.buffer_positions.append(np.array([0.0, 0.0]))
-                self.buffer_yaws.append(0.0)
-                print(f"  First frame accepted")
-                
-                if rgb is not None:
-                    current_pos = self.get_current_robot_position()
-                    self.visualizer.visualize(
-                        self.frame_count, 
-                        rgb, 
-                        self.map_manager.global_map, 
-                        current_pos, 
-                        self.robot_trajectory, 
-                        self.lidar_resolution
-                    )
-                
-                self.frame_count += 1
-                bin_path.unlink()
-                rgb_path.unlink()
-                return True
-            
-            random_pairs = generate_random_pairs(len(temp_buffer), self.num_random_pairs)
-            print(f"  Attempt {attempt + 1}: Random pairs: {random_pairs}")
-            
-            result = self.pose_calculator.estimate_motion_multiframe(
-                temp_buffer, 
-                refine_rotation=True,
-                random_pairs=random_pairs,
-                current_global_pos=self.robot_pos,
-                current_global_yaw=self.robot_yaw
-            )
-            
-            if result is None:
-                attempt += 1
-                print(f"  Registration failed, retrying... (attempt {attempt}/{max_attempts})")
-                continue
-            
-            if len(result) == 5:
-                frame_positions, frame_yaws, global_positions, global_yaws, fitness = result
-            elif len(result) == 4:
-                frame_positions, frame_yaws, global_positions, global_yaws = result
-                fitness = None
+        local_cell_map = self.points_to_cell_map(lidar)
+        
+        # For ICP: use obstacle points only if enabled, otherwise use all points
+        if self.use_obstacles_only:
+            lidar_for_icp = self.filter_obstacle_points(lidar)
+        else:
+            lidar_for_icp = lidar.copy()
+        
+        temp_buffer = list(self.point_cloud_buffer) + [lidar_for_icp]
+        
+        if len(self.buffer_positions) == 0:
+            if self.use_obstacles_only:
+                lidar_for_icp = self.filter_obstacle_points(lidar)
             else:
-                frame_positions, frame_yaws = result
-                global_positions, global_yaws = None, None
-                fitness = None
-            
-            if fitness is not None:
-                print(f"  Fitness: {fitness:.4f} (threshold: {self.fitness_threshold})")
+                lidar_for_icp = lidar.copy()
                 
-                if fitness < self.fitness_threshold:
-                    attempt += 1
-                    print(f"  Fitness too low, retrying... (attempt {attempt}/{max_attempts})")
-                    continue
-                else:
-                    print(f"  ✓ Fitness acceptable!")
+            self.point_cloud_buffer.append(lidar_for_icp)
+            self.local_cell_map_buffer.append(local_cell_map)
+            self.buffer_positions.append(np.array([0.0, 0.0]))
+            self.buffer_yaws.append(0.0)
+            self.frame_count += 1
+            os.remove(bin_path)
+            os.remove(rgb_path)
+            print(f"  First frame accepted")
+            return True
+        
+        random_pairs = generate_random_pairs(len(temp_buffer)-1, self.num_random_pairs)
+        
+        result = self.pose_calculator.estimate_motion_multiframe(
+            temp_buffer, 
+            pairs=random_pairs,
+            current_global_pos=self.robot_pos,
+            current_global_yaw=self.robot_yaw
+        )
+        
+        os.remove(bin_path)
+        os.remove(rgb_path)
+        print("Data loaded and deleted")
+        
+        if result is not None:
+            frame_positions, frame_yaws, global_positions, global_yaws = result
             
-            self.point_cloud_buffer.append(lidar.copy())
-            self.local_occupancy_buffer.append(local_occupancy)
-            
+            if self.use_obstacles_only:
+                lidar_for_icp = self.filter_obstacle_points(lidar)
+            else:
+                lidar_for_icp = lidar.copy()
+                
+            self.point_cloud_buffer.append(lidar_for_icp)
+            self.local_cell_map_buffer.append(local_cell_map)
+            buffer_positions_old = [pos.copy() for pos in self.buffer_positions]
+            buffer_yaws_old = list(self.buffer_yaws)
+                    
             positions_changed = []
-            
             for i in range(len(self.buffer_positions)):
                 old_pos = self.buffer_positions[i]
                 new_pos = frame_positions[i]
@@ -261,32 +277,44 @@ class FarmMapper:
                 pos_diff = np.linalg.norm(old_pos - new_pos)
                 yaw_diff = abs(normalize_angle(new_yaw - old_yaw))
                 
-                if pos_diff > 0.05 or yaw_diff > np.deg2rad(2):
+                if pos_diff > 0.05 or yaw_diff > np.deg2rad(0.4):
                     positions_changed.append(i)
                     print(f"    Frame {i} updated: "
-                          f"pos ({old_pos[0]:.2f}, {old_pos[1]:.2f}) -> ({new_pos[0]:.2f}, {new_pos[1]:.2f}), "
-                          f"yaw {np.degrees(old_yaw):.1f}° -> {np.degrees(new_yaw):.1f}°")
-            
+                        f"pos Δ{pos_diff:.3f}m, yaw Δ{np.degrees(yaw_diff):.1f}°")
+
+            for i in range(len(frame_positions)):
+                if i < len(self.buffer_positions):
+                    self.buffer_positions[i] = frame_positions[i].copy()
+                    self.buffer_yaws[i] = frame_yaws[i]
+                else:
+                    self.buffer_positions.append(frame_positions[i].copy())
+                    self.buffer_yaws.append(frame_yaws[i])
+                    
             if len(positions_changed) > 0:
-                print(f"  {len(positions_changed)} frame(s) updated, rebuilding global map...")
                 
+                print(f"  {len(positions_changed)} frame(s) updated, rebuilding global map...")
                 self.map_manager.update_global_map_for_buffer(
-                    frame_positions, frame_yaws, 
-                    self.buffer_positions, self.buffer_yaws,
-                    self.local_occupancy_buffer, self.robot_pos, self.robot_yaw
+                    frame_positions, frame_yaws,
+                    buffer_positions_old, buffer_yaws_old,  
+                    self.local_cell_map_buffer,
+                    self.robot_pos, self.robot_yaw,
+                    self.cell_size
                 )
                 
-                for i in range(len(frame_positions)):
-                    if i < len(self.buffer_positions):
-                        self.buffer_positions[i] = frame_positions[i].copy()
-                        self.buffer_yaws[i] = frame_yaws[i]
-                    else:
-                        self.buffer_positions.append(frame_positions[i].copy())
-                        self.buffer_yaws.append(frame_yaws[i])
-                
-                if global_positions is not None and len(self.robot_trajectory) > 0:
-                    self.robot_trajectory[-1] = global_positions[0].copy()
-                    print(f"  Updated trajectory point: ({global_positions[0][0]:.2f}, {global_positions[0][1]:.2f})")
+                if len(self.robot_trajectory) >= len(self.buffer_positions):
+                    trajectory_start_idx = len(self.robot_trajectory) - len(self.buffer_positions)
+                                
+                    for i in range(len(self.buffer_positions)):
+                        rel_pos = self.buffer_positions[i]
+                        rel_yaw = self.buffer_yaws[i]
+                        cos_yaw = np.cos(self.robot_yaw)
+                        sin_yaw = np.sin(self.robot_yaw)
+                        global_pos = self.robot_pos.copy()
+                        global_pos[0] += cos_yaw * rel_pos[0] - sin_yaw * rel_pos[1]
+                        global_pos[1] += sin_yaw * rel_pos[0] + cos_yaw * rel_pos[1]
+                        
+                        self.robot_trajectory[trajectory_start_idx + i] = global_pos
+            
             else:
                 self.buffer_positions.append(frame_positions[-1].copy())
                 self.buffer_yaws.append(frame_yaws[-1])
@@ -306,7 +334,7 @@ class FarmMapper:
                     new_global_pos[1] += sin_yaw * rel_pos[0] + cos_yaw * rel_pos[1]
                     new_global_yaw = normalize_angle(self.robot_yaw + rel_yaw)
                 
-                self.map_manager.add_to_global_map(local_occupancy, new_global_pos, new_global_yaw)
+                self.map_manager.add_to_global_map(local_cell_map, new_global_pos, new_global_yaw, self.cell_size)
             
             if len(self.point_cloud_buffer) == self.buffer_size:
                 rel_pos = frame_positions[1]
@@ -325,8 +353,8 @@ class FarmMapper:
                 
                 self.robot_trajectory.append(self.robot_pos.copy())
                 
-                print(f"  Robot pos: ({self.robot_pos[0]:.2f}, {self.robot_pos[1]:.2f}), "
-                      f"yaw: {np.degrees(self.robot_yaw):.1f}°")
+                print(f"{str('~')*100}Robot pos: ({self.robot_pos[0]:.2f}, {self.robot_pos[1]:.2f}), "
+                        f"yaw: {np.degrees(self.robot_yaw):.1f}°")
             
             if rgb is not None:
                 current_pos = self.get_current_robot_position()
@@ -336,19 +364,13 @@ class FarmMapper:
                     self.map_manager.global_map, 
                     current_pos, 
                     self.robot_trajectory, 
-                    self.lidar_resolution
+                    self.cell_size
                 )
             
             self.frame_count += 1
             
-            print(f"  Deleting processed files...")
-            bin_path.unlink()
-            rgb_path.unlink()
-            
-            return True
-        
-        print(f"  ✗ Failed to achieve fitness threshold after {max_attempts} attempts")
-        return False
+        return True
+    
     
     def get_current_robot_position(self):
         if len(self.buffer_positions) == 0:
@@ -369,25 +391,22 @@ class FarmMapper:
     def run_realtime(self, check_interval=1.0):
         print(f"\nStarting realtime processing...")
         print(f"Checking for new files every {check_interval} seconds")
-        print(f"Press Ctrl+C to stop\n")
+        bin_path, rgb_path = os.path.join(self.lidar_dir, "pointcloud_sync.bin"), os.path.join(self.rgb_dir, "rgb.png")
         
-        processed_bins = set()
-        processed_rgbs = set()
+        print(f"\nProcessing files:")
+        print(f"  BIN: {bin_path}")
+        print(f"  RGB: {rgb_path}")
+        
         
         try:
             while True:
-                bin_path, rgb_path = self.find_latest_files()
                 
-                if bin_path is not None and rgb_path is not None:
-                    if bin_path not in processed_bins and rgb_path not in processed_rgbs:
-                        success = self.process_files(bin_path, rgb_path)
-                        
-                        if success:
-                            processed_bins.add(bin_path)
-                            processed_rgbs.add(rgb_path)
-                            print(f"  ✓ Files processed successfully!")
-                        else:
-                            print(f"  ✗ Failed to process files")
+                success = self.process_files(bin_path, rgb_path)
+                
+                if success:
+                    print(f"  ✓ Files processed successfully!")
+                else:
+                    print(f"  ✗ Failed to process files")
                 
                 time.sleep(check_interval)
                 
@@ -398,14 +417,18 @@ class FarmMapper:
 
 
 if __name__ == "__main__":
-    data_root = "/home/nahyeon/navi/AgriChrono/data/fargo/test300/20251105_1623"
+    data_root = "/home/nahyeon/navi/AgriChrono/data/fargo/1110"
+    subdirs = sorted([d for d in os.listdir(data_root) if os.path.isdir(os.path.join(data_root, d))])
+    data_root = os.path.join(data_root, subdirs[-1])
     
     mapper = FarmMapper(
         data_root,
-        buffer_size=4, 
-        num_random_pairs=2, 
-        fitness_threshold=0.95,
-        sample_points_num=30000
+        buffer_size=10, 
+        num_random_pairs=4, 
+        fitness_threshold=0.85,
+        sample_points_num=10000,
+        cell_size=0.05,  # 10cm cells
+        use_obstacles_only=True  # Set to True to use only obstacle points for ICP
     )
     
     mapper.run_realtime(check_interval=1.0)

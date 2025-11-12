@@ -4,6 +4,10 @@ from scipy.spatial.transform import Rotation
 from scipy.spatial import KDTree
 from sklearn.cluster import DBSCAN
 
+RADIUS = 0.5
+GICP_NN = 50
+VOXEL_SIZE = 0.05
+FITNESS = 0.85
 
 def normalize_angle(angle):
     return np.arctan2(np.sin(angle), np.cos(angle))
@@ -19,10 +23,9 @@ class PlaneDetector:
     def detect_planes(self, points, min_plane_size=500, max_planes=10):
         if len(points) < 100:
             return []
-        
+            
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points)
-        
         planes = []
         remaining_points = points.copy()
         
@@ -137,9 +140,7 @@ class PlaneDetector:
 
 
 class PoseCalculator:
-    def __init__(self, voxel_size=0.02, voxel_size_fine=0.01):
-        self.voxel_size = voxel_size
-        self.voxel_size_fine = voxel_size_fine
+    def __init__(self):
         self.cached_normals = {}
         self.plane_detector = PlaneDetector(
             distance_threshold=0.05,
@@ -148,12 +149,10 @@ class PoseCalculator:
         )
     
     def downsample_points(self, points, voxel_size=None):
-        if voxel_size is None:
-            voxel_size = self.voxel_size
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points)
         pcd_down = pcd.voxel_down_sample(voxel_size)
-        return np.asarray(pcd_down.points)
+        return np.asarray(pcd_down.points, dtype=np.float64)
     
     def estimate_rotation_from_planes(self, planes1, planes2, matches):
         if len(matches) < 2:
@@ -168,6 +167,7 @@ class PoseCalculator:
                 vertical_planes2.append(planes2[j])
         
         if len(vertical_planes1) < 2:
+            print("No vertical planes")
             return None, 0.0
         
         angles = []
@@ -238,81 +238,47 @@ class PoseCalculator:
         
         return mean_translation, confidence
     
-    def estimate_motion_from_planes(self, prev_points, curr_points, 
-                                    min_plane_size=500, 
-                                    use_icp_fallback=True):
+
+    def estimate_rotation_robust(self, prev_points, curr_points):
+        prev_down = self.downsample_points(prev_points, voxel_size=0.15)
+        curr_down = self.downsample_points(curr_points, voxel_size=0.15)
         
-        print("  [PLANE-BASED ESTIMATION]")
+        if len(prev_down) < 100 or len(curr_down) < 100:
+            return 0.0, 0.0
         
-        planes_prev = self.plane_detector.detect_planes(
-            prev_points, 
-            min_plane_size=min_plane_size,
-            max_planes=10
+        source = o3d.geometry.PointCloud()
+        target = o3d.geometry.PointCloud()
+        source.points = o3d.utility.Vector3dVector(curr_down)
+        target.points = o3d.utility.Vector3dVector(prev_down)
+        
+        source.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.3, max_nn=30))
+        target.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.3, max_nn=30))
+        
+        source_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+            source, o3d.geometry.KDTreeSearchParamHybrid(radius=0.6, max_nn=100))
+        target_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+            target, o3d.geometry.KDTreeSearchParamHybrid(radius=0.6, max_nn=100))
+        
+        result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+            source, target, source_fpfh, target_fpfh,
+            mutual_filter=True,
+            max_correspondence_distance=0.75,
+            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+            ransac_n=3,
+            checkers=[
+                o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
+                o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(0.75)
+            ],
+            criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(100000, 0.999)
         )
         
-        planes_curr = self.plane_detector.detect_planes(
-            curr_points,
-            min_plane_size=min_plane_size,
-            max_planes=10
-        )
+        R = result.transformation[:3, :3]
+        angle = np.arctan2(R[1,0], R[0,0])
+        confidence = result.fitness
         
-        print(f"    Detected planes: prev={len(planes_prev)}, curr={len(planes_curr)}")
+        print(f"    FPFH-RANSAC: angle={np.degrees(angle):.2f}°, fitness={confidence:.3f}")
         
-        if len(planes_prev) < 2 or len(planes_curr) < 2:
-            print("    [FALLBACK] Not enough planes detected")
-            if use_icp_fallback:
-                return self.estimate_motion_icp_single(prev_points, curr_points)
-            else:
-                return np.eye(4), False, 0.0
-        
-        matches = self.plane_detector.match_planes(planes_prev, planes_curr)
-        
-        print(f"    Plane matches: {len(matches)}")
-        
-        if len(matches) < 2:
-            print("    [FALLBACK] Not enough plane matches")
-            if use_icp_fallback:
-                return self.estimate_motion_icp_single(prev_points, curr_points)
-            else:
-                return np.eye(4), False, 0.0
-        
-        rotation_angle, rot_confidence = self.estimate_rotation_from_planes(
-            planes_prev, planes_curr, matches
-        )
-        
-        if rotation_angle is None or rot_confidence < 0.3:
-            print(f"    [FALLBACK] Low rotation confidence: {rot_confidence:.3f}")
-            if use_icp_fallback:
-                return self.estimate_motion_icp_single(prev_points, curr_points)
-            else:
-                return np.eye(4), False, 0.0
-        
-        print(f"    Rotation: {np.degrees(rotation_angle):.2f}° (conf={rot_confidence:.3f})")
-        
-        translation, trans_confidence = self.estimate_translation_from_planes(
-            planes_prev, planes_curr, matches, rotation_angle
-        )
-        
-        if translation is None or trans_confidence < 0.3:
-            print(f"    [FALLBACK] Low translation confidence: {trans_confidence:.3f}")
-            if use_icp_fallback:
-                return self.estimate_motion_icp_single(prev_points, curr_points)
-            else:
-                return np.eye(4), False, 0.0
-        
-        print(f"    Translation: dx={translation[0]:.3f}, dy={translation[1]:.3f}, dz={translation[2]:.3f} (conf={trans_confidence:.3f})")
-        
-        overall_confidence = (rot_confidence + trans_confidence) / 2
-        
-        transformation = np.eye(4)
-        transformation[:3, :3] = np.array([
-            [np.cos(rotation_angle), -np.sin(rotation_angle), 0],
-            [np.sin(rotation_angle), np.cos(rotation_angle), 0],
-            [0, 0, 1]
-        ])
-        transformation[:3, 3] = translation
-        
-        return transformation, True, overall_confidence
+        return angle, confidence
     
     def estimate_rotation_polar_fast(self, prev_points, curr_points, num_angles=360, 
                                      angle_range=None, center_angle=None):
@@ -321,8 +287,8 @@ class PoseCalculator:
         
         n_prev = len(prev_2d)
         n_curr = len(curr_2d)
-        sample_size_prev = min(4000, n_prev)
-        sample_size_curr = min(4000, n_curr)
+        sample_size_prev = min(8000, n_prev)
+        sample_size_curr = min(8000, n_curr)
         
         if n_prev > sample_size_prev:
             prev_indices = np.random.choice(n_prev, sample_size_prev, replace=False)
@@ -361,7 +327,7 @@ class PoseCalculator:
             dist, _ = tree.query([prev_2d[i]], k=2)
             distances_in_prev.append(dist[0][1])
         median_spacing = np.median(distances_in_prev)
-        inlier_threshold = max(0.5, median_spacing * 3)
+        inlier_threshold = max(0.25, median_spacing * 1.5)
         
         for i in range(num_angles):
             curr_rotated = np.empty_like(curr_centered)
@@ -379,7 +345,8 @@ class PoseCalculator:
             outliers = residuals > huber_delta
             residuals[outliers] = huber_delta * (2 * np.sqrt(residuals[outliers]) - 1)
             
-            score = inlier_ratio * 10 - np.mean(residuals)
+            mean_inlier_dist = np.mean(distances[inliers]) if np.sum(inliers) > 0 else 1e6
+            score = inlier_ratio * 100 - mean_inlier_dist * 10
             
             if score > best_score:
                 best_score = score
@@ -392,21 +359,28 @@ class PoseCalculator:
     
     def estimate_rotation_combined(self, prev_points, curr_points, refine=False, coarse_angle=None):
         if not refine or coarse_angle is None:
-            rotation_polar, conf_polar = self.estimate_rotation_polar_fast(
-                prev_points, curr_points, num_angles=360
-            )
+            # rotation_polar, conf_polar = self.estimate_rotation_polar_fast(
+            #     prev_points, curr_points, num_angles=360, angle_range=np.deg2rad(180),
+            # )
+            
+            rotation_polar, conf_polar = self.estimate_rotation_robust(
+                                                        prev_points, curr_points)
             return rotation_polar, conf_polar
         else:
             angle_range = np.deg2rad(10)
-            rotation_fine, conf_fine = self.estimate_rotation_polar_fast(
-                prev_points, curr_points, 
-                num_angles=50,
-                angle_range=angle_range,
-                center_angle=coarse_angle
-            )
+            # rotation_fine, conf_fine = self.estimate_rotation_polar_fast(
+            #     prev_points, curr_points, 
+            #     num_angles=50,
+            #     angle_range=angle_range,
+            #     center_angle=coarse_angle
+            # )
+            
+            rotation_fine, conf_fine = self.estimate_rotation_robust(
+                                                        prev_points, curr_points)
             print(f"    Fine-tuning: {np.degrees(coarse_angle):.2f}° -> {np.degrees(rotation_fine):.2f}°")
             return rotation_fine, conf_fine
     
+
     def estimate_translation_icp(self, prev_points, curr_points, rotation_angle):
         cos_a = np.cos(rotation_angle)
         sin_a = np.sin(rotation_angle)
@@ -420,22 +394,27 @@ class PoseCalculator:
         curr_rotated_3d = curr_points.copy()
         curr_rotated_3d[:, :2] = curr_rotated_2d
         
-        prev_down = self.downsample_points(prev_points, voxel_size=0.03)
-        curr_down = self.downsample_points(curr_rotated_3d, voxel_size=0.03)
+        prev_down = self.downsample_points(prev_points, voxel_size=VOXEL_SIZE)
+        curr_down = self.downsample_points(curr_rotated_3d, voxel_size=VOXEL_SIZE)
         
         source = o3d.geometry.PointCloud()
         target = o3d.geometry.PointCloud()
         source.points = o3d.utility.Vector3dVector(curr_down)
         target.points = o3d.utility.Vector3dVector(prev_down)
         
+        # normals 필요 (GICP도 이걸 사용)
         source.estimate_normals(
-            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.3, max_nn=20)
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=RADIUS, max_nn=GICP_NN)
         )
         target.estimate_normals(
-            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.3, max_nn=20)
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=RADIUS, max_nn=GICP_NN)
         )
         
-        threshold = 0.4
+        source.orient_normals_consistent_tangent_plane(k=15)
+        target.orient_normals_consistent_tangent_plane(k=15)
+        
+        # GICP로 변경: registration_generalized_icp + TransformationEstimationForGeneralizedICP
+        max_corr_distance = 0.4  # 필요에 따라 0.2~0.6 사이로 튜닝
         trans_init = np.eye(4)
         
         criteria = o3d.pipelines.registration.ICPConvergenceCriteria(
@@ -444,9 +423,9 @@ class PoseCalculator:
             max_iteration=100
         )
         
-        reg = o3d.pipelines.registration.registration_icp(
-            source, target, threshold, trans_init,
-            o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+        reg = o3d.pipelines.registration.registration_generalized_icp(
+            source, target, max_corr_distance, trans_init,
+            o3d.pipelines.registration.TransformationEstimationForGeneralizedICP(),
             criteria
         )
         
@@ -454,46 +433,48 @@ class PoseCalculator:
         fitness = reg.fitness
         inlier_rmse = reg.inlier_rmse
         
-        print(f"    Translation: dx={translation[0]:.3f}, dy={translation[1]:.3f}, dz={translation[2]:.3f}")
-        print(f"    ICP fitness={fitness:.3f}, rmse={inlier_rmse:.3f}")
+        # print(f"    Translation: dx={translation[0]:.3f}, dy={translation[1]:.3f}, dz={translation[2]:.3f}")
+        print(f"\nGICP fitness={fitness:.3f}, rmse={inlier_rmse:.3f}\n{str('-')*30}")
         
         return translation, fitness, inlier_rmse
+
     
-    def estimate_motion_icp_single(self, prev_points, curr_points, init_transformation=None, refine_rotation=False, 
-                                   skip_rotation_mode=False, fitness_threshold=0.7):
+    def estimate_motion_icp_single(self, prev_points, curr_points, init_transformation=None, refine_rotation=False, icp_max_distance=VOXEL_SIZE*1.5):
         if prev_points is None or curr_points is None:
+            print("cal_pose.py - estimate_motion_icp_single :  points are None")
             return np.eye(4), False, 0.0
         
         if len(prev_points) < 100 or len(curr_points) < 100:
+            print("cal_pose.py - estimate_motion_icp_single :  points are not enough")
             return np.eye(4), False, 0.0
         
-        prev_down = self.downsample_points(prev_points, voxel_size=0.025)
-        curr_down = self.downsample_points(curr_points, voxel_size=0.025)
+        prev_down = self.downsample_points(prev_points, voxel_size=VOXEL_SIZE)
+        curr_down = self.downsample_points(curr_points, voxel_size=VOXEL_SIZE)
         
         source = o3d.geometry.PointCloud()
         target = o3d.geometry.PointCloud()
         source.points = o3d.utility.Vector3dVector(curr_down)
         target.points = o3d.utility.Vector3dVector(prev_down)
-        
         source.estimate_normals(
-            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.3, max_nn=20)
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=RADIUS, max_nn=GICP_NN)
         )
         target.estimate_normals(
-            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.3, max_nn=20)
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=RADIUS, max_nn=GICP_NN)
         )
         
-        threshold = 0.4
-        trans_init = init_transformation if init_transformation is not None else np.eye(4)
+        source.orient_normals_consistent_tangent_plane(k=15)
+        target.orient_normals_consistent_tangent_plane(k=15)
         
+        trans_init = init_transformation if init_transformation is not None else np.eye(4, dtype=np.float64)
         criteria = o3d.pipelines.registration.ICPConvergenceCriteria(
             relative_fitness=1e-6,
             relative_rmse=1e-6,
             max_iteration=100
         )
-        
-        reg_p2l = o3d.pipelines.registration.registration_icp(
-            source, target, threshold, trans_init,
-            o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+        max_corr_distance = icp_max_distance
+        reg_p2l = o3d.pipelines.registration.registration_generalized_icp(
+            source, target, max_corr_distance, trans_init,
+            o3d.pipelines.registration.TransformationEstimationForGeneralizedICP(),
             criteria
         )
         
@@ -503,20 +484,13 @@ class PoseCalculator:
         
         R_p2l = transformation[:3, :3]
         rotation_angle_p2l = np.arccos(np.clip((np.trace(R_p2l) - 1) / 2, -1, 1))
-        print(f"    fitness={fitness:.3f}")
         
-        if fitness > 0.9:
-            print("    [TRANSLATION MODE]")
-            print(f"    P2L: fitness={fitness:.3f}, rot={np.degrees(rotation_angle_p2l):.2f}°, rmse={inlier_rmse:.3f}")
+        if fitness > 0.95 and inlier_rmse < VOXEL_SIZE*3:         ############################################################################THRESHOLDTHRESHOLDTHRESHOLDTHRESHOLDTHRESHOLDTHRESHOLDTHRESHOLDTHRESHOLDTHRESHOLDTHRESHOLDTHRESHOLDTHRESHOLD
+            print(f"    [TRANSLATION MODE] fitness={fitness:.3f}, rot={np.degrees(rotation_angle_p2l):.2f}°")
             return transformation, True, fitness
         else:
-            print("    [ROTATION MODE]")
+            print(f"    [ROTATION MODE] fitness={fitness:.3f}")
             rotation_angle, conf_rotation = self.estimate_rotation_combined(prev_points, curr_points)
-            
-            if conf_rotation < 0.3:
-                print(f"    [REJECTED] Low rotation confidence: {conf_rotation:.3f}")
-                exit()
-                return np.eye(4), False, 0.0
             
             if refine_rotation:
                 rotation_angle, conf_rotation = self.estimate_rotation_combined(
@@ -525,12 +499,16 @@ class PoseCalculator:
                     coarse_angle=rotation_angle
                 )
             
+            if conf_rotation < 0.2:
+                print(f"    !!!!!!![REJECTED] Low rotation confidence: {conf_rotation:.3f}")
+                return np.eye(4), False, 0.0
+            
             translation, fitness, inlier_rmse = self.estimate_translation_icp(
                 prev_points, curr_points, rotation_angle
             )
             
-            if fitness < 0.5 or inlier_rmse > 0.5:
-                print(f"    [REJECTED] fitness={fitness:.3f}, rmse={inlier_rmse:.3f}")
+            if fitness < FITNESS or inlier_rmse > 0.5:
+                print(f"    !!!!!!![REJECTED] fitness={fitness:.3f}, rmse={inlier_rmse:.3f}")
                 return np.eye(4), False, 0.0
             
             transformation = np.eye(4)
@@ -542,50 +520,33 @@ class PoseCalculator:
             transformation[:3, 3] = translation
             return transformation, True, fitness
     
-    def estimate_motion_multiframe(self, point_cloud_buffer, refine_rotation=False, random_pairs=None, 
-                                   current_global_pos=None, current_global_yaw=None, use_plane_method=True):
+    def estimate_motion_multiframe(self, point_cloud_buffer, pairs=None, 
+                                   current_global_pos=None, current_global_yaw=None):
         n_frames = len(point_cloud_buffer)
-        
         if n_frames < 2:
             return None
         
-        if random_pairs is None:
-            pairs = [(i, i+1) for i in range(n_frames - 1)]
-        else:
-            pairs = random_pairs
-        
         pairwise_transformations = {}
         fitness_scores = {}
-        
         sequential_pairs = [(i, i+1) for i in range(n_frames - 1)]
         
         for i, j in sequential_pairs:
             prev_trans = np.eye(4)
             
-            if use_plane_method:
-                trans, success, fitness = self.estimate_motion_from_planes(
-                    point_cloud_buffer[i],
-                    point_cloud_buffer[j],
-                    min_plane_size=500,
-                    use_icp_fallback=True
-                )
-            else:
-                trans, success, fitness = self.estimate_motion_icp_single(
-                    point_cloud_buffer[i], 
-                    point_cloud_buffer[j],
-                    init_transformation=prev_trans.copy(),
-                    refine_rotation=refine_rotation,
-                    skip_rotation_mode=False,
-                    fitness_threshold=0.7
-                )
+            trans, success, fitness = self.estimate_motion_icp_single(
+                        point_cloud_buffer[i], 
+                        point_cloud_buffer[j],
+                        init_transformation=np.eye(4),
+                        refine_rotation=True,
+                        )
             
             if success:
                 pairwise_transformations[(i, j)] = trans
                 fitness_scores[(i, j)] = fitness
             else:
                 print(f"    Frame {i}->{j}: FAILED")
-                pairwise_transformations[(i, j)] = np.eye(4)
-                fitness_scores[(i, j)] = 0.0
+                if i == n_frames-2 and j == n_frames -1:
+                    return None
         
         for i, j in pairs:
             if (i, j) in pairwise_transformations or j != i + 1:
@@ -598,14 +559,12 @@ class PoseCalculator:
                         point_cloud_buffer[j],
                         init_transformation=np.eye(4),
                         refine_rotation=False,
-                        skip_rotation_mode=True,
-                        fitness_threshold=0.7
                     )
                     
                     if success:
                         pairwise_transformations[(i, j)] = trans
                         fitness_scores[(i, j)] = fitness
-                        print(f"    Frame {i}->{j}: fitness={fitness:.3f} (non-sequential)")
+                        print(f"    Frame {i}->{j}: fitness={fitness:.3f}")
                         
                         self._update_sequential_transforms(
                             pairwise_transformations, 
@@ -613,7 +572,7 @@ class PoseCalculator:
                             i, j, trans, fitness
                         )
                     else:
-                        print(f"    Frame {i}->{j}: FAILED (non-sequential)")
+                        print(f"    Frame {i}->{j}: FAILED ")
         
         if len(pairwise_transformations) == 0:
             return None
@@ -725,33 +684,62 @@ class GlobalMapManager:
     def __init__(self):
         self.global_map = {}
     
-    def remove_occupancy_from_map(self, local_occupancy, robot_pos, robot_yaw):
+    def remove_cell_from_map(self, local_cell_map, robot_pos, robot_yaw, cell_size):
+        """
+        Remove cells from global map
+        local_cell_map: dict with (cell_x, cell_y) as keys
+        """
         cos_yaw = np.cos(robot_yaw)
         sin_yaw = np.sin(robot_yaw)
         
-        for (local_x, local_y), value in local_occupancy.items():
+        for (local_cell_x, local_cell_y), value in local_cell_map.items():
+            # Convert cell coordinates to local world coordinates (cell center)
+            local_x = (local_cell_x + 0.5) * cell_size
+            local_y = (local_cell_y + 0.5) * cell_size
+            
+            # Rotate to global frame
             rotated_x = cos_yaw * local_x - sin_yaw * local_y
             rotated_y = sin_yaw * local_x + cos_yaw * local_y
             
+            # Transform to global position
             global_x = robot_pos[0] + rotated_x
             global_y = robot_pos[1] + rotated_y
-            key = (round(global_x, 2), round(global_y, 2))
+            
+            # Convert back to cell coordinates
+            global_cell_x = int(np.floor(global_x / cell_size))
+            global_cell_y = int(np.floor(global_y / cell_size))
+            key = (global_cell_x, global_cell_y)
             
             self.global_map.pop(key, None)
     
-    def add_to_global_map(self, local_occupancy, robot_pos, robot_yaw):
+    def add_to_global_map(self, local_cell_map, robot_pos, robot_yaw, cell_size):
+        """
+        Add cells to global map with proper coordinate transformation
+        local_cell_map: dict with (cell_x, cell_y) as keys and 0/1/2 as values
+        """
         cos_yaw = np.cos(robot_yaw)
         sin_yaw = np.sin(robot_yaw)
         
         updates = {}
-        for (local_x, local_y), value in local_occupancy.items():
+        for (local_cell_x, local_cell_y), value in local_cell_map.items():
+            # Convert cell coordinates to local world coordinates (cell center)
+            local_x = (local_cell_x + 0.5) * cell_size
+            local_y = (local_cell_y + 0.5) * cell_size
+            
+            # Rotate to global frame
             rotated_x = cos_yaw * local_x - sin_yaw * local_y
             rotated_y = sin_yaw * local_x + cos_yaw * local_y
             
+            # Transform to global position
             global_x = robot_pos[0] + rotated_x
             global_y = robot_pos[1] + rotated_y
-            key = (round(global_x, 2), round(global_y, 2))
             
+            # Convert back to cell coordinates
+            global_cell_x = int(np.floor(global_x / cell_size))
+            global_cell_y = int(np.floor(global_y / cell_size))
+            key = (global_cell_x, global_cell_y)
+            
+            # Update cell: obstacles (2) take priority over road (1)
             if key in self.global_map:
                 updates[key] = max(self.global_map[key], value)
             else:
@@ -761,14 +749,18 @@ class GlobalMapManager:
     
     def update_global_map_for_buffer(self, frame_positions, frame_yaws, 
                                      buffer_positions, buffer_yaws,
-                                     local_occupancy_buffer, robot_pos, robot_yaw):
+                                     local_cell_map_buffer, robot_pos, robot_yaw, cell_size):
+        """
+        Update global map when buffer frame positions are updated
+        """
         print(f"  Updating global map for all {len(frame_positions)} frames in buffer")
         
         buffer_start_global_pos = robot_pos.copy()
         buffer_start_global_yaw = robot_yaw
         
+        # First, remove all old cells
         for i in range(len(buffer_positions)):
-            if i < len(local_occupancy_buffer):
+            if i < len(local_cell_map_buffer):
                 old_global_pos = buffer_start_global_pos.copy()
                 old_global_yaw = buffer_start_global_yaw
                 
@@ -782,14 +774,16 @@ class GlobalMapManager:
                 old_global_pos[1] += sin_start_yaw * rel_pos[0] + cos_start_yaw * rel_pos[1]
                 old_global_yaw = normalize_angle(buffer_start_global_yaw + rel_yaw)
                 
-                self.remove_occupancy_from_map(
-                    local_occupancy_buffer[i],
+                self.remove_cell_from_map(
+                    local_cell_map_buffer[i],
                     old_global_pos,
-                    old_global_yaw
+                    old_global_yaw,
+                    cell_size
                 )
         
+        # Then, add all cells with new positions
         for i in range(len(frame_positions)):
-            if i < len(local_occupancy_buffer):
+            if i < len(local_cell_map_buffer):
                 new_global_pos = buffer_start_global_pos.copy()
                 new_global_yaw = buffer_start_global_yaw
                 
@@ -804,9 +798,8 @@ class GlobalMapManager:
                 new_global_yaw = normalize_angle(buffer_start_global_yaw + rel_yaw)
                 
                 self.add_to_global_map(
-                    local_occupancy_buffer[i],
+                    local_cell_map_buffer[i],
                     new_global_pos,
-                    new_global_yaw
+                    new_global_yaw,
+                    cell_size
                 )
-                
-                

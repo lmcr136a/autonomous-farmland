@@ -10,52 +10,83 @@ class MapVisualizer:
         self.vis_dir.mkdir(parents=True, exist_ok=True)
         self.pixels_per_meter = pixels_per_meter
     
-    def render_occupancy_map(self, global_map, robot_pos):
-        if len(global_map) == 0:
+    def render_cell_map(self, cell_map, robot_pos, cell_size):
+        """
+        Render cell-based occupancy map
+        cell_map: dict with (cell_x, cell_y) as keys and 0/1/2 as values
+        cell_size: size of each cell in meters
+        Returns: rendered image and coordinate info
+        """
+        if len(cell_map) == 0:
             img = np.ones((400, 400, 3), dtype=np.uint8) * 30
             return img, 200, 200, 0, 0, 400, 400
         
-        world_xs = [k[0] for k in global_map.keys()]
-        world_ys = [k[1] for k in global_map.keys()]
+        # Get cell coordinate bounds
+        cell_xs = [k[0] for k in cell_map.keys()]
+        cell_ys = [k[1] for k in cell_map.keys()]
         
-        min_x, max_x = min(world_xs), max(world_xs)
-        min_y, max_y = min(world_ys), max(world_ys)
+        # Calculate robot's cell position
+        robot_cell_x = int(np.floor(robot_pos[0] / cell_size))
+        robot_cell_y = int(np.floor(robot_pos[1] / cell_size))
         
-        min_x = min(min_x, robot_pos[0])
-        max_x = max(max_x, robot_pos[0])
-        min_y = min(min_y, robot_pos[1])
-        max_y = max(max_y, robot_pos[1])
+        min_cell_x = min(min(cell_xs), robot_cell_x)
+        max_cell_x = max(max(cell_xs), robot_cell_x)
+        min_cell_y = min(min(cell_ys), robot_cell_y)
+        max_cell_y = max(max(cell_ys), robot_cell_y)
         
-        margin = 5.0
-        min_x -= margin
-        min_y -= margin
-        max_x += margin
-        max_y += margin
+        # Add margin in cells
+        margin_cells = int(np.ceil(5.0 / cell_size))  # 5m margin
+        min_cell_x -= margin_cells
+        min_cell_y -= margin_cells
+        max_cell_x += margin_cells
+        max_cell_y += margin_cells
         
-        range_x = max_x - min_x
-        range_y = max_y - min_y
+        # Calculate map dimensions in cells
+        map_width_cells = max_cell_x - min_cell_x + 1
+        map_height_cells = max_cell_y - min_cell_y + 1
         
-        map_width = int(range_x * self.pixels_per_meter) + 1
-        map_height = int(range_y * self.pixels_per_meter) + 1
+        # Each cell will be rendered as multiple pixels for visibility
+        pixels_per_cell = max(1, int(self.pixels_per_meter * cell_size))
         
-        occupancy = np.ones((map_height, map_width, 3), dtype=np.uint8) * 30
+        map_width_pixels = map_width_cells * pixels_per_cell
+        map_height_pixels = map_height_cells * pixels_per_cell
         
-        for (wx, wy), value in global_map.items():
-            px = int((wx - min_x) * self.pixels_per_meter)
-            py = int((wy - min_y) * self.pixels_per_meter)
-            if 0 <= px < map_width and 0 <= py < map_height:
-                if value == 0:
-                    occupancy[py, px] = [255, 255, 255]
-                else:
-                    occupancy[py, px] = [0, 0, 255]
+        # Initialize map with dark background (unknown)
+        cell_img = np.ones((map_height_pixels, map_width_pixels, 3), dtype=np.uint8) * 30
         
-        robot_px = int((robot_pos[0] - min_x) * self.pixels_per_meter)
-        robot_py = int((robot_pos[1] - min_y) * self.pixels_per_meter)
+        # Render each cell
+        for (cell_x, cell_y), value in cell_map.items():
+            # Calculate pixel position for this cell
+            px_start = (cell_x - min_cell_x) * pixels_per_cell
+            py_start = (cell_y - min_cell_y) * pixels_per_cell
+            px_end = px_start + pixels_per_cell
+            py_end = py_start + pixels_per_cell
+            
+            if 0 <= px_start < map_width_pixels and 0 <= py_start < map_height_pixels:
+                if value == 1:  # road
+                    cell_img[py_start:py_end, px_start:px_end] = [255, 255, 255]
+                elif value == 2:  # obstacle
+                    cell_img[py_start:py_end, px_start:px_end] = [0, 0, 255]
+                # value == 0 (unknown) stays as dark background
         
-        return occupancy, robot_px, robot_py, min_x, min_y, map_width, map_height
+        # Calculate robot pixel position
+        robot_px = int((robot_cell_x - min_cell_x + 0.5) * pixels_per_cell)
+        robot_py = int((robot_cell_y - min_cell_y + 0.5) * pixels_per_cell)
+        
+        # Convert cell bounds back to world coordinates for display
+        min_x = min_cell_x * cell_size
+        min_y = min_cell_y * cell_size
+        
+        return cell_img, robot_px, robot_py, min_x, min_y, map_width_pixels, map_height_pixels
     
-    def visualize(self, frame_id, rgb, global_map, robot_pos, robot_trajectory, lidar_resolution):
-        occupancy, robot_x, robot_y, min_x, min_y, map_w, map_h = self.render_occupancy_map(global_map, robot_pos)
+    def visualize(self, frame_id, rgb, cell_map, robot_pos, robot_trajectory, cell_size):
+        """
+        Visualize RGB image and cell-based map
+        cell_size: size of each cell in meters
+        """
+        cell_img, robot_x, robot_y, min_x, min_y, map_w, map_h = self.render_cell_map(
+            cell_map, robot_pos, cell_size
+        )
         
         fig, axes = plt.subplots(1, 2, figsize=(16, 7))
         
@@ -63,7 +94,7 @@ class MapVisualizer:
         axes[0].set_title(f"Frame: R_{frame_id}.png", fontsize=12)
         axes[0].axis('off')
         
-        map_display = occupancy.copy()
+        map_display = cell_img.copy()
         
         if 0 <= robot_x < map_w and 0 <= robot_y < map_h:
             cv2.circle(map_display, (robot_x, robot_y), 8, (0, 255, 0), -1)
@@ -73,8 +104,19 @@ class MapVisualizer:
         
         if len(robot_trajectory) > 1:
             traj = np.array(robot_trajectory)
-            traj_px = (traj[:, 0] - min_x) * self.pixels_per_meter
-            traj_py = (traj[:, 1] - min_y) * self.pixels_per_meter
+            # Convert world coordinates to pixel coordinates
+            # First convert to cell coordinates, then to pixels
+            traj_cell_x = np.floor(traj[:, 0] / cell_size).astype(int)
+            traj_cell_y = np.floor(traj[:, 1] / cell_size).astype(int)
+            
+            # Convert cell coordinates to pixel coordinates
+            min_cell_x = int(np.floor(min_x / cell_size))
+            min_cell_y = int(np.floor(min_y / cell_size))
+            pixels_per_cell = max(1, int(self.pixels_per_meter * cell_size))
+            
+            traj_px = (traj_cell_x - min_cell_x + 0.5) * pixels_per_cell
+            traj_py = (traj_cell_y - min_cell_y + 0.5) * pixels_per_cell
+            
             axes[1].plot(traj_px, traj_py, 'b-', linewidth=2, alpha=0.7, label='Trajectory')
         
         if 0 <= robot_x < map_w and 0 <= robot_y < map_h:
@@ -82,18 +124,23 @@ class MapVisualizer:
                         markeredgecolor='white', markeredgewidth=1.5)
         
         axes[1].invert_yaxis()
-        axes[1].set_title(f'Occupancy Map (White: Ground, Red: Obstacle, Dark: Unknown)', fontsize=12)
+        axes[1].set_title(f'Cell Map (White: Road, Red: Obstacle, Dark: Unknown)', fontsize=12)
         axes[1].set_xlabel('X (pixels)')
         axes[1].set_ylabel('Y (pixels)')
         axes[1].legend(loc='upper right')
         axes[1].grid(True, alpha=0.3)
         
-        world_width = map_w / self.pixels_per_meter
-        world_height = map_h / self.pixels_per_meter
-        axes[1].text(0.02, 0.98, f'Map size: {world_width:.1f}m × {world_height:.1f}m\n'
-                                  f'Robot: ({robot_pos[0]:.2f}, {robot_pos[1]:.2f})m',
+        world_width = map_w * cell_size / self.pixels_per_meter
+        world_height = map_h * cell_size / self.pixels_per_meter
+        num_cells = len(cell_map)
+        axes[1].text(0.02, 0.98, 
+                    f'Map size: {world_width:.1f}m × {world_height:.1f}m\n'
+                    f'Cell size: {cell_size*100:.0f}cm\n'
+                    f'Active cells: {num_cells}\n'
+                    f'Robot: ({robot_pos[0]:.2f}, {robot_pos[1]:.2f})m',
                     transform=axes[1].transAxes, fontsize=10,
-                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+                    verticalalignment='top', 
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
         
         plt.tight_layout()
         
